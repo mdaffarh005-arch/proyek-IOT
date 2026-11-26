@@ -1,0 +1,465 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <LittleFS.h>
+#include <DHT.h>
+
+// ===================== KONFIGURASI JARINGAN & MQTT =====================
+// Di Wokwi gunakan SSID "Wokwi-GUEST" dan password ""; di hardware sesuaikan SSID/password
+const char* WIFI_SSID      = "Wokwi-GUEST";
+const char* WIFI_PASS      = "";
+
+const char* MQTT_SERVER    = "broker.hivemq.com"; // atau IP broker lokal / EMQX
+const uint16_t MQTT_PORT   = 1883;
+const char* MQTT_CLIENT_ID = "esp32_room3_node_01";
+
+// Kontrak Topik MQTT sesuai LKM
+const char* TOPIC_TELEMETRY = "factory/room3/telemetry";
+const char* TOPIC_CONTROL   = "factory/room3/control";
+const char* TOPIC_ALARM     = "factory/room3/alarm";
+const char* TOPIC_STATUS    = "factory/room3/status";
+
+// Berkas Buffer LittleFS sesuai LKM
+const char* BUFFER_FILE_PATH = "/sensor_buffer.txt";
+
+// ===================== PEMETAAN PIN HARDWARE =====================
+#define DHT_PIN         21
+#define DHT_TYPE        DHT11
+#define POT_ADC_PIN     34   // ADC1 (aman saat Wi-Fi aktif)
+#define BTN_ESTOP_PIN   25   // Push Button Emergency Stop (INPUT_PULLUP -> aktif LOW)
+#define BTN_RESET_PIN   4    // Push Button Reset Emergency (INPUT_PULLUP -> aktif LOW)
+#define LED_GREEN_PIN   26   // Aktuator / Relay (LED Hijau)
+#define LED_YELLOW_PIN  27   // Status / Mode AUTO-MANUAL (LED Kuning)
+#define LED_RED_PIN     14   // Alarm Kondisi Kritis (LED Merah)
+
+// ===================== AMBANG BATAS & EVENT GROUP =====================
+const float TEMP_ACTUATOR_ON_MAX = 28.0f; // Aktuator AUTO menyala jika suhu < 28.0 C
+const float TEMP_CRITICAL_MIN    = 30.0f; // Kondisi kritis jika suhu >= 30.0 C
+
+#define EVT_EMERGENCY_BIT   (1 << 0) // 0x01: Emergency Stop aktif
+#define EVT_CRITICAL_BIT    (1 << 1) // 0x02: Suhu kritis aktif
+#define EVT_WIFI_OK_BIT     (1 << 2) // 0x04: Wi-Fi & MQTT siap
+
+// ===================== STRUKTUR DATA & OBJEK GLOBAL =====================
+struct SensorReading {
+  float temperature;
+  float humidity;
+  float potVoltage;     // Tegangan analog (0.00 - 3.30 V)
+  uint32_t timestampMs;
+};
+
+struct SystemState {
+  float temperature = 0.0f;
+  float humidity    = 0.0f;
+  float potVoltage  = 0.0f;
+  bool autoMode     = true;   // Default: AUTO
+  bool manualRelay  = false;  // Status relay saat mode MANUAL
+  bool relayState   = false;  // Status aktual aktuator / LED Hijau
+  bool emergency    = false;  // Status tombol Emergency Stop
+  bool critical     = false;  // Status ambang kritis
+};
+
+DHT dht(DHT_PIN, DHT_TYPE);
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+QueueHandle_t sensorQueue;
+SemaphoreHandle_t stateMutex;
+SemaphoreHandle_t isrSemaphore;
+EventGroupHandle_t sysEventGroup;
+
+SystemState currentState;
+volatile bool isrTriggeredFlag = false;
+volatile uint32_t lastIsrMillis = 0;
+
+// ===================== INTERRUPT SERVICE ROUTINE (ISR) =====================
+void IRAM_ATTR emergencyButtonISR() {
+  uint32_t now = millis();
+  // Debounce sederhana di ISR (150 ms)
+  if (now - lastIsrMillis > 150) {
+    lastIsrMillis = now;
+    isrTriggeredFlag = true;
+    xEventGroupSetBitsFromISR(sysEventGroup, EVT_EMERGENCY_BIT, NULL);
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(isrSemaphore, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+  }
+}
+
+// ===================== HELPER CLEAR EMERGENCY =====================
+void clearEmergencyState(const char* source) {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  currentState.emergency = false;
+  isrTriggeredFlag = false;
+  xEventGroupClearBits(sysEventGroup, EVT_EMERGENCY_BIT);
+  xSemaphoreGive(stateMutex);
+  Serial.printf("[INTERLOCK] Status Emergency di-reset via %s.\n", source);
+}
+
+// ===================== HELPER LITTLEFS & PAYLOAD JSON =====================
+bool initLittleFS() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("[LittleFS] Gagal menginisialisasi LittleFS!");
+    return false;
+  }
+  Serial.println("[LittleFS] Berhasil diinisialisasi.");
+  return true;
+}
+
+void buildTelemetryJson(const SystemState& st, char* outBuf, size_t bufLen) {
+  StaticJsonDocument<256> doc;
+  doc["temperature"] = serialized(String(st.temperature, 1));
+  doc["humidity"]    = serialized(String(st.humidity, 1));
+  doc["potensiometer"] = serialized(String(st.potVoltage, 2));
+  doc["mode"]        = st.autoMode ? "AUTO" : "MANUAL";
+  doc["relay"]       = st.relayState ? 1 : 0;
+
+  if (st.emergency) {
+    doc["interlock_status"] = "EMERGENCY_STOP";
+  } else if (st.critical) {
+    doc["interlock_status"] = "CRITICAL";
+  } else {
+    doc["interlock_status"] = "OK";
+  }
+
+  serializeJson(doc, outBuf, bufLen);
+}
+
+void appendToLittleFSBuffer(const char* jsonLine) {
+  File f = LittleFS.open(BUFFER_FILE_PATH, FILE_APPEND);
+  if (!f) {
+    Serial.println("[LittleFS] Gagal membuka file buffer untuk menulis.");
+    return;
+  }
+  f.println(jsonLine);
+  f.close();
+  Serial.printf("[LittleFS] Data tersimpan offline: %s\n", jsonLine);
+}
+
+void flushLittleFSBuffer() {
+  if (!LittleFS.exists(BUFFER_FILE_PATH)) return;
+  if (!mqttClient.connected()) return;
+
+  File f = LittleFS.open(BUFFER_FILE_PATH, FILE_READ);
+  if (!f) return;
+
+  Serial.println("[LittleFS] Memulai burst flush data buffer...");
+  int flushedCount = 0;
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    if (mqttClient.publish(TOPIC_TELEMETRY, line.c_str(), false)) {
+      flushedCount++;
+      delay(20);
+    } else {
+      Serial.println("[LittleFS] Gagal publish saat flush, berhenti sementara.");
+      break;
+    }
+  }
+  f.close();
+
+  if (flushedCount > 0 && mqttClient.connected()) {
+    LittleFS.remove(BUFFER_FILE_PATH);
+    Serial.printf("[LittleFS] Selesai flush %d data & buffer dibersihkan.\n", flushedCount);
+  }
+}
+
+void publishAlarmEvent(const char* reason, float tempVal) {
+  if (!mqttClient.connected()) return;
+
+  StaticJsonDocument<200> alarmDoc;
+  alarmDoc["node"]         = MQTT_CLIENT_ID;
+  alarmDoc["alarm"]        = true;
+  alarmDoc["reason"]       = reason;
+  alarmDoc["temperature"]  = serialized(String(tempVal, 1));
+  alarmDoc["timestamp_ms"] = millis();
+
+  char alarmPayload[200];
+  serializeJson(alarmDoc, alarmPayload, sizeof(alarmPayload));
+
+  // Publikasi alarm dengan QoS 1
+  mqttClient.publish(TOPIC_ALARM, alarmPayload, true);
+  Serial.printf("[ALARM QoS1] Terkirim: %s\n", alarmPayload);
+}
+
+// ===================== CALLBACK DOWNLINK MQTT =====================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  char msg[160];
+  size_t copyLen = (length < sizeof(msg) - 1) ? length : (sizeof(msg) - 1);
+  memcpy(msg, payload, copyLen);
+  msg[copyLen] = '\0';
+
+  Serial.printf("[MQTT RX] Topik: %s | Payload: %s\n", topic, msg);
+
+  if (strcmp(topic, TOPIC_CONTROL) != 0) return;
+
+  StaticJsonDocument<160> doc;
+  DeserializationError err = deserializeJson(doc, msg);
+  if (err) {
+    Serial.println("[MQTT RX] JSON tidak valid, diabaikan.");
+    return;
+  }
+
+  if (doc.containsKey("reset_emergency") && doc["reset_emergency"] == true) {
+    clearEmergencyState("MQTT");
+  }
+
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+
+  if (doc.containsKey("mode")) {
+    const char* modeStr = doc["mode"];
+    if (strcasecmp(modeStr, "AUTO") == 0) {
+      currentState.autoMode = true;
+      Serial.println("[CONTROL] Mode diubah ke AUTO");
+    } else if (strcasecmp(modeStr, "MANUAL") == 0) {
+      currentState.autoMode = false;
+      Serial.println("[CONTROL] Mode diubah ke MANUAL");
+    }
+  }
+
+  if (doc.containsKey("relay")) {
+    int relayVal = doc["relay"].as<int>();
+    if (!currentState.autoMode) {
+      currentState.manualRelay = (relayVal == 1);
+      Serial.printf("[CONTROL] Manual relay di-set ke: %d\n", currentState.manualRelay ? 1 : 0);
+    } else {
+      Serial.println("[CONTROL] Perintah relay diabaikan karena sistem sedang mode AUTO.");
+    }
+  }
+
+  xSemaphoreGive(stateMutex);
+}
+
+// ===================== KONEKSI WI-FI & MQTT =====================
+void ensureWiFiAndMqtt() {
+  if (WiFi.status() != WL_CONNECTED) {
+    xEventGroupClearBits(sysEventGroup, EVT_WIFI_OK_BIT);
+    static uint32_t lastWifiTry = 0;
+    if (millis() - lastWifiTry > 3000) {
+      lastWifiTry = millis();
+      Serial.printf("[WiFi] Menghubungkan ke %s...\n", WIFI_SSID);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+    return;
+  }
+
+  if (!mqttClient.connected()) {
+    xEventGroupClearBits(sysEventGroup, EVT_WIFI_OK_BIT);
+    static uint32_t lastMqttTry = 0;
+    if (millis() - lastMqttTry > 3000) {
+      lastMqttTry = millis();
+      Serial.printf("[MQTT] Menghubungkan ke broker %s...\n", MQTT_SERVER);
+
+      // LWT: topik factory/room3/status, payload "OFFLINE", retained = true
+      bool connected = mqttClient.connect(
+        MQTT_CLIENT_ID,
+        nullptr,
+        nullptr,
+        TOPIC_STATUS,
+        1,
+        true,
+        "OFFLINE"
+      );
+
+      if (connected) {
+        Serial.println("[MQTT] Terhubung ke broker!");
+        mqttClient.publish(TOPIC_STATUS, "ONLINE", true);
+        mqttClient.subscribe(TOPIC_CONTROL, 1);
+        xEventGroupSetBits(sysEventGroup, EVT_WIFI_OK_BIT);
+        flushLittleFSBuffer();
+      } else {
+        Serial.printf("[MQTT] Gagal konek, rc=%d\n", mqttClient.state());
+      }
+    }
+  } else {
+    xEventGroupSetBits(sysEventGroup, EVT_WIFI_OK_BIT);
+    mqttClient.loop();
+  }
+}
+
+// ===================== FREERTOS TASKS =====================
+void TaskSensor(void* pvParameters) {
+  (void) pvParameters;
+  const TickType_t xDelay = pdMS_TO_TICKS(3000); // Baca tiap 3 detik (<= 5 detik sesuai TP-01)
+
+  for (;;) {
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    int rawAdc = analogRead(POT_ADC_PIN);
+    float voltage = (rawAdc / 4095.0f) * 3.3f;
+
+    if (!isnan(t) && !isnan(h)) {
+      SensorReading reading;
+      reading.temperature = t;
+      reading.humidity    = h;
+      reading.potVoltage  = voltage;
+      reading.timestampMs = millis();
+
+      xQueueSend(sensorQueue, &reading, pdMS_TO_TICKS(100));
+    } else {
+      Serial.println("[SENSOR] Pembacaan DHT11 NaN, dilewati.");
+    }
+
+    vTaskDelay(xDelay);
+  }
+}
+
+void TaskControlLogic(void* pvParameters) {
+  (void) pvParameters;
+  SensorReading rxData;
+  bool prevEmergency = false;
+  bool prevCritical  = false;
+
+  for (;;) {
+    // Cek tombol fisik Reset Emergency (GPIO 4 -> aktif LOW)
+    static uint32_t lastResetPress = 0;
+    if (digitalRead(BTN_RESET_PIN) == LOW && (millis() - lastResetPress > 250)) {
+      lastResetPress = millis();
+      clearEmergencyState("Tombol Fisik GPIO 4");
+    }
+
+    // Respons cepat jika ada sinyal ISR tombol Emergency Stop (GPIO 25)
+    if (xSemaphoreTake(isrSemaphore, pdMS_TO_TICKS(50)) == pdTRUE) {
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      currentState.emergency = true;
+      currentState.relayState = false; // Matikan aktuator seketika
+      digitalWrite(LED_GREEN_PIN, LOW);
+      digitalWrite(LED_RED_PIN, HIGH);
+      xSemaphoreGive(stateMutex);
+      Serial.println("[ISR] Tombol EMERGENCY STOP ditekan! Aktuator OFF instan.");
+    }
+
+    // Ambil data sensor terbaru dari Queue jika tersedia
+    if (xQueueReceive(sensorQueue, &rxData, pdMS_TO_TICKS(50)) == pdTRUE) {
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      currentState.temperature = rxData.temperature;
+      currentState.humidity    = rxData.humidity;
+      currentState.potVoltage  = rxData.potVoltage;
+
+      // Evaluasi kondisi kritis (suhu >= 30.0 C)
+      currentState.critical = (currentState.temperature >= TEMP_CRITICAL_MIN);
+      if (currentState.critical) {
+        xEventGroupSetBits(sysEventGroup, EVT_CRITICAL_BIT);
+      } else {
+        xEventGroupClearBits(sysEventGroup, EVT_CRITICAL_BIT);
+      }
+
+      // Evaluasi aktuator & Event Group Safety Interlock
+      if (currentState.emergency) {
+        currentState.relayState = false;
+      } else if (currentState.autoMode) {
+        // Mode AUTO: LED Hijau aktif jika suhu < 28.0 C dan tegangan potensiometer aman (< 3.0 V)
+        bool potSafe = (currentState.potVoltage < 3.0f);
+        currentState.relayState = (currentState.temperature < TEMP_ACTUATOR_ON_MAX) && potSafe;
+      } else {
+        // Mode MANUAL: ikuti perintah downlink relay
+        currentState.relayState = currentState.manualRelay;
+      }
+
+      // Terapkan ke output fisik LED (tetap berjalan walau Wi-Fi terputus)
+      digitalWrite(LED_GREEN_PIN, currentState.relayState ? HIGH : LOW);
+      digitalWrite(LED_YELLOW_PIN, currentState.autoMode ? HIGH : LOW);
+      digitalWrite(LED_RED_PIN, (currentState.emergency || currentState.critical) ? HIGH : LOW);
+
+      bool nowEmergency = currentState.emergency;
+      bool nowCritical  = currentState.critical;
+      float tempNow     = currentState.temperature;
+      xSemaphoreGive(stateMutex);
+
+      // Kirim alarm QoS 1 saat baru memasuki kondisi darurat atau kritis
+      if (nowEmergency && !prevEmergency) {
+        publishAlarmEvent("EMERGENCY_STOP_ISR", tempNow);
+      }
+      if (nowCritical && !prevCritical) {
+        publishAlarmEvent("HIGH_TEMPERATURE_CRITICAL", tempNow);
+      }
+      prevEmergency = nowEmergency;
+      prevCritical  = nowCritical;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+void TaskNetworkMqtt(void* pvParameters) {
+  (void) pvParameters;
+  const TickType_t xPublishInterval = pdMS_TO_TICKS(3000);
+  TickType_t lastPublishTick = xTaskGetTickCount();
+
+  for (;;) {
+    ensureWiFiAndMqtt();
+
+    if ((xTaskGetTickCount() - lastPublishTick) >= xPublishInterval) {
+      lastPublishTick = xTaskGetTickCount();
+
+      SystemState snapshot;
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      snapshot = currentState;
+      xSemaphoreGive(stateMutex);
+
+      char payloadBuf[256];
+      buildTelemetryJson(snapshot, payloadBuf, sizeof(payloadBuf));
+
+      if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
+        flushLittleFSBuffer();
+        bool ok = mqttClient.publish(TOPIC_TELEMETRY, payloadBuf, false);
+        if (ok) {
+          Serial.printf("[MQTT TX] %s -> %s\n", TOPIC_TELEMETRY, payloadBuf);
+        } else {
+          appendToLittleFSBuffer(payloadBuf);
+        }
+      } else {
+        // Wi-Fi atau MQTT terputus -> simpan ke LittleFS Store-and-Forward
+        appendToLittleFSBuffer(payloadBuf);
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ===================== SETUP & LOOP =====================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n=== Smart Industrial Room & Safety Interlock System ===");
+
+  pinMode(BTN_ESTOP_PIN, INPUT_PULLUP);
+  pinMode(BTN_RESET_PIN, INPUT_PULLUP);
+  pinMode(LED_GREEN_PIN, OUTPUT);
+  pinMode(LED_YELLOW_PIN, OUTPUT);
+  pinMode(LED_RED_PIN, OUTPUT);
+
+  digitalWrite(LED_GREEN_PIN, LOW);
+  digitalWrite(LED_YELLOW_PIN, HIGH); // Default mode AUTO
+  digitalWrite(LED_RED_PIN, LOW);
+
+  analogReadResolution(12); // 0..4095
+  dht.begin();
+  initLittleFS();
+
+  sensorQueue   = xQueueCreate(10, sizeof(SensorReading));
+  stateMutex    = xSemaphoreCreateMutex();
+  isrSemaphore  = xSemaphoreCreateBinary();
+  sysEventGroup = xEventGroupCreate();
+
+  attachInterrupt(digitalPinToInterrupt(BTN_ESTOP_PIN), emergencyButtonISR, FALLING);
+
+  WiFi.mode(WIFI_STA);
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setBufferSize(512);
+
+  xTaskCreatePinnedToCore(TaskSensor,       "TaskSensor",       4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(TaskControlLogic, "TaskControlLogic", 4096, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(TaskNetworkMqtt,  "TaskNetworkMqtt",  6144, NULL, 1, NULL, 0);
+}
+
+void loop() {
+  // Semua logika utama dijalankan oleh FreeRTOS tasks
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
